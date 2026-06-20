@@ -300,19 +300,23 @@ impl InnerStore {
         self.kv.remove(FRONTIERS_KEY);
         let store = &mut self.store;
         let arena = &self.arena;
-        self.kv.with_kv(|kv| {
-            arena.with_guards(|guards| {
-                let iter = kv.scan(Bound::Unbounded, Bound::Unbounded);
-                for (k, v) in iter {
+        let entries = self.kv.with_kv(|kv| {
+            kv.scan(Bound::Unbounded, Bound::Unbounded)
+                .map(|(k, v)| {
                     let cid = ContainerID::from_bytes(&k);
                     let c = ContainerWrapper::new_from_bytes(v);
-                    let parent = c.parent();
-                    let idx = guards.register_container(&cid);
-                    let p = parent.as_ref().map(|p| guards.register_container(p));
-                    guards.set_parent(idx, p);
-                    if Self::insert_entry(store, idx, c).is_some() {}
-                }
-            });
+                    let parent = c.parent().cloned();
+                    (cid, c, parent)
+                })
+                .collect::<Vec<_>>()
+        });
+        arena.with_guards(|guards| {
+            for (cid, c, parent) in entries {
+                let idx = guards.register_container(&cid);
+                let p = parent.as_ref().map(|p| guards.register_container(p));
+                guards.set_parent(idx, p);
+                if Self::insert_entry(store, idx, c).is_some() {}
+            }
         });
 
         self.load_state = LoadState::AllLoaded;
@@ -326,22 +330,23 @@ impl InnerStore {
 
         let store = &mut self.store;
         let arena = &self.arena;
-        self.kv.with_kv(|kv| {
-            let iter = kv.scan(Bound::Unbounded, Bound::Unbounded);
-            arena.with_guards(|guards| {
-                for (k, v) in iter {
-                    let cid = ContainerID::from_bytes(&k);
-                    let idx = guards.register_container(&cid);
-                    if Self::contains_idx_in(store, idx) {
-                        // the container is already loaded
-                        // the content in `store` is guaranteed to be newer than the content in `kv`
-                        continue;
-                    }
-
-                    let container = ContainerWrapper::new_from_bytes(v);
-                    Self::insert_entry(store, idx, container);
+        let entries = self.kv.with_kv(|kv| {
+            kv.scan(Bound::Unbounded, Bound::Unbounded)
+                .map(|(k, v)| (ContainerID::from_bytes(&k), v))
+                .collect::<Vec<_>>()
+        });
+        arena.with_guards(|guards| {
+            for (cid, v) in entries {
+                let idx = guards.register_container(&cid);
+                if Self::contains_idx_in(store, idx) {
+                    // the container is already loaded
+                    // the content in `store` is guaranteed to be newer than the content in `kv`
+                    continue;
                 }
-            });
+
+                let container = ContainerWrapper::new_from_bytes(v);
+                Self::insert_entry(store, idx, container);
+            }
         });
 
         self.load_state = LoadState::AllLoaded;
@@ -353,16 +358,18 @@ impl InnerStore {
         }
 
         let arena = &self.arena;
-        self.kv.with_kv(|kv| {
-            let iter = kv.scan(Bound::Unbounded, Bound::Unbounded);
-            arena.with_guards(|guards| {
-                for (k, _) in iter {
+        let root_ids = self.kv.with_kv(|kv| {
+            kv.scan(Bound::Unbounded, Bound::Unbounded)
+                .filter_map(|(k, _)| {
                     let cid = ContainerID::from_bytes(&k);
-                    if cid.is_root() {
-                        guards.register_container(&cid);
-                    }
-                }
-            });
+                    cid.is_root().then_some(cid)
+                })
+                .collect::<Vec<_>>()
+        });
+        arena.with_guards(|guards| {
+            for cid in root_ids {
+                guards.register_container(&cid);
+            }
         });
         self.load_state = LoadState::RootsLoaded;
     }
@@ -402,5 +409,61 @@ impl InnerStore {
         let mut new_store = Self::new(arena, config.clone());
         new_store.decode(bytes).unwrap();
         new_store
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use loro_common::{ContainerType, ID};
+
+    #[test]
+    fn load_all_deadlocks_when_mergeable_parent_resolver_reenters_kv() {
+        let arena = SharedArena::new();
+        let mut store = InnerStore::new(arena.clone(), Configure::default());
+
+        let parent_id = ContainerID::new_normal(ID::new(1, 0), ContainerType::Map);
+        let mergeable_child_id =
+            ContainerID::new_mergeable(&parent_id, "field", ContainerType::Text);
+        let mergeable_child_bytes = {
+            let encoding_arena = SharedArena::new();
+            let parent_idx = encoding_arena.register_container(&parent_id);
+            encoding_arena.set_parent(parent_idx, None);
+            let child_idx = encoding_arena.register_container(&mergeable_child_id);
+            encoding_arena.set_parent(child_idx, Some(parent_idx));
+            let state = crate::state::create_state_(child_idx, &Configure::default(), 1);
+            let mut wrapper = ContainerWrapper::new(state, &encoding_arena);
+            wrapper.encode()
+        };
+
+        let kv_for_resolver = store.kv.arc_clone();
+        arena.set_parent_resolver(Some(move |child_id: ContainerID| {
+            let key = child_id.to_bytes();
+            let value = kv_for_resolver.get(&key)?;
+            let container = ContainerWrapper::new_from_bytes(value);
+            container.parent().cloned()
+        }));
+
+        store.load_state = LoadState::Lazy;
+        store.kv.set_all(
+            [(
+                Bytes::from(mergeable_child_id.to_bytes()),
+                mergeable_child_bytes,
+            )]
+            .into_iter(),
+        );
+
+        // This never returns on rev 52d8168:
+        //
+        // load_all()
+        //   -> kv.with_kv(...) holds the KV mutex
+        //   -> guards.register_container(mergeable_child_id)
+        //   -> register_container(parent_id)
+        //   -> set_parent(... parent_id ...)
+        //   -> get_depth(parent_id)
+        //   -> parent_resolver(parent_id)
+        //   -> kv.get(parent_id) tries to lock the same mutex again
+        store.load_all();
     }
 }
